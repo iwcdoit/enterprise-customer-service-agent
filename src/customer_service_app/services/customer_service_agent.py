@@ -23,6 +23,7 @@ from customer_service_app.prompts.customer_service import (
     format_knowledge_context,
 )
 from customer_service_app.services.conversation_service import ConversationService
+from customer_service_app.services.conversation_memory import ConversationMemoryCompactor
 from customer_service_app.services.question_preprocessor import QuestionPreprocessor
 from customer_service_app.services.rag_service import RagService
 from customer_service_app.services.tool_registry import ToolExecutionContext, ToolRegistry
@@ -55,6 +56,7 @@ class CustomerServiceAgent:
         self._search_client = search_client
         self._semantic_cache = semantic_cache
         self._conversation_service = ConversationService(session)
+        self._memory_compactor = ConversationMemoryCompactor()
         self._question_preprocessor = QuestionPreprocessor()
 
     async def answer(self, request: ChatRequest) -> ChatResponse:
@@ -130,7 +132,7 @@ class CustomerServiceAgent:
             )
         )
 
-        messages = await self._build_llm_messages(request, conversation.id, knowledge)
+        messages = await self._build_llm_messages(request, conversation.id, knowledge, trace)
 
         # Tool definitions are passed as a structured API parameter.
         # They are not embedded in the user question.
@@ -224,12 +226,26 @@ class CustomerServiceAgent:
         request: ChatRequest,
         conversation_id: str,
         knowledge: list[KnowledgeChunk],
+        trace: list[ChatTraceStep],
     ) -> list[dict[str, Any]]:
         """Build model messages from policy prompt, history, knowledge, and the current question."""
 
         history = request.history
         if not history:
             history = await self._conversation_service.recent_history(conversation_id)
+        memory_window = self._memory_compactor.compact(history)
+        trace.append(
+            ChatTraceStep(
+                stage="memory",
+                detail="已整理短期历史消息",
+                metadata={
+                    "original_count": memory_window.original_count,
+                    "compressed_count": memory_window.compressed_count,
+                    "final_count": len(memory_window.messages),
+                    "compressed": memory_window.compressed,
+                },
+            )
+        )
         knowledge_context = format_knowledge_context([item.model_dump() for item in knowledge])
         system_prompt = CUSTOMER_SERVICE_SYSTEM_PROMPT.format(
             tenant_id=request.tenant_id,
@@ -237,7 +253,7 @@ class CustomerServiceAgent:
         )
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-        messages.extend(self._to_llm_messages(history))
+        messages.extend(self._to_llm_messages(memory_window.messages))
         messages.append({"role": "user", "content": request.question})
         return messages
 
